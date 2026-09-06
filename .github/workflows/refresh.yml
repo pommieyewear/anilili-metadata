@@ -1,0 +1,102 @@
+# Daily rebuild of the anime metadata tree the app reads.
+#
+# Belongs at .github/workflows/refresh.yml in the *dataset* repo, not this one. The dataset repo is
+# self-contained by necessity: the app's source is not on GitHub, so the workflow cannot check it
+# out — konoha_build.py is vendored alongside this file and updated by hand when it changes.
+#
+# Only the airing half is re-fetched from TMDB. A finished series has the episode list it will
+# always have, so re-asking for all fifteen thousand daily would add ~20 minutes and change
+# nothing. Use the `full` input to force a complete rebuild after a generator change.
+name: Refresh metadata
+
+on:
+  schedule:
+    # 05:00 UTC — after the Japanese broadcast day has finished and TMDB contributors have had a
+    # night to add stills, and outside the hour when everyone else's cron fires.
+    - cron: "0 5 * * *"
+  workflow_dispatch:
+    inputs:
+      full:
+        description: "Re-fetch every title from TMDB, not just airing ones"
+        type: boolean
+        default: false
+
+concurrency:
+  # Two refreshes pushing the same tree would conflict on the commit, and the loser's work is lost
+  # anyway. Never cancel a run in flight: it holds the only copy of an hours-long TMDB walk.
+  group: refresh
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    steps:
+      # Depth 2, not 1: the purge step diffs HEAD~1 against HEAD to find what changed, and a depth-1
+      # clone has no HEAD~1. Full history is ~60,000 files a day of churn and would make the daily
+      # clone the slowest step in the job.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install requests
+
+      # Cached so an interrupted or rate-limited run resumes instead of re-walking AniList from
+      # 1900. The key rotates daily so the cache never outlives the data in it.
+      - uses: actions/cache@v4
+        with:
+          path: build/konoha
+          key: konoha-work-${{ github.run_id }}
+          restore-keys: konoha-work-
+
+      - name: Walk AniList
+        run: python scripts/konoha_build.py catalog
+
+      - name: Fetch episode lists
+        env:
+          TMDB_READ_TOKEN: ${{ secrets.TMDB_READ_TOKEN }}
+        run: |
+          if [ "${{ inputs.full }}" = "true" ]; then
+            python scripts/konoha_build.py episodes --out data
+          else
+            python scripts/konoha_build.py episodes --out data --airing-only
+          fi
+
+      - name: Emit tree
+        run: python scripts/konoha_build.py emit --out data
+
+      - name: Commit
+        id: commit
+        run: |
+          git config user.name "konoha-refresh"
+          # The noreply form, so an automated commit never publishes an address.
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A data
+          if git diff --cached --quiet; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            git commit -m "Refresh metadata $(date -u +%Y-%m-%d)"
+            git push
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # jsDelivr caches a branch reference for up to twelve hours and does not watch for pushes, so
+      # without this the commit above reaches no device until the cache expires on its own.
+      - name: Purge jsDelivr
+        if: steps.commit.outputs.changed == 'true'
+        run: |
+          for path in index.json id-map.json airing.json stats.json sync-status.json; do
+            curl -sS "https://purge.jsdelivr.net/gh/${{ github.repository }}@main/data/$path" > /dev/null
+          done
+          git diff --name-only HEAD~1 HEAD -- data \
+            | sed 's|^data/||' \
+            | head -n 2000 \
+            | xargs -P 16 -I {} curl -sS -o /dev/null \
+                "https://purge.jsdelivr.net/gh/${{ github.repository }}@main/data/{}"
