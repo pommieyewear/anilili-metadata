@@ -1056,9 +1056,16 @@ def schedule_row(entry: dict) -> dict | None:
     """One airing as the app stores it, or None for an entry with no title behind it.
 
     The fields are exactly what a schedule row renders — `title.preferred` falls back
-    english → romaji → native and `coverImage.best` prefers extraLarge, so all of those are carried
-    rather than a single pre-picked string, which would freeze the app's own preference order into
-    the dataset. Nulls are dropped: the reader defaults them and a month is mostly nulls.
+    english → romaji → native and `coverImage.best` prefers extraLarge, so those are carried rather
+    than a single pre-picked string, which would freeze the app's own preference order into the
+    dataset. Nulls are dropped: the reader defaults them and a month is mostly nulls.
+
+    The exception is `native`, which is written only when it is the only title there is. It is the
+    last rung of that fallback and almost never reached — across 2026-09, 663 rows, the number with
+    no english *and* no romaji was zero — but it is a full Japanese title string on every row, so
+    carrying it unconditionally cost 28% of the compressed file to answer a question nobody asked
+    (22,192 bytes against 15,915). Written conditionally the fallback still works for the row that
+    one day needs it, and costs nothing for the ones that do not.
     """
     media = entry.get("media") or {}
     if not media.get("id"):
@@ -1071,7 +1078,11 @@ def schedule_row(entry: dict) -> dict | None:
         "airingAt": entry.get("airingAt"),
         "english": title.get("english"),
         "romaji": title.get("romaji"),
-        "native": title.get("native"),
+        "native": (
+            title.get("native")
+            if not title.get("english") and not title.get("romaji")
+            else None
+        ),
         "cover": cover.get("extraLarge") or cover.get("large"),
         "format": media.get("format"),
         "year": media.get("seasonYear"),

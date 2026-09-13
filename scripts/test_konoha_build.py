@@ -270,8 +270,16 @@ airing = {
 }
 row = schedule_row(airing)
 check("cover prefers extraLarge", row["cover"], "https://x/xl.jpg")
-check("every title form is carried", (row["english"], row["romaji"], row["native"]),
-      ("One Piece", "ONE PIECE", "ワンピース"))
+check("the titles the app actually picks from are carried", (row["english"], row["romaji"]),
+      ("One Piece", "ONE PIECE"))
+# `native` is the last rung of the app's fallback and is written only when the rungs above it are
+# missing — it is a full Japanese string on every row and carrying it always cost 28% of the file.
+check("native is dropped when a title has something above it", "native" in row, False)
+check(
+    "native is kept when it is the only title there is",
+    schedule_row({**airing, "media": {**airing["media"], "title": {"native": "ワンピース"}}})["native"],
+    "ワンピース",
+)
 check("a non-adult row says nothing at all", "adult" in row, False)
 check("an adult row is flagged", "adult" in schedule_row(
     {**airing, "media": {**airing["media"], "isAdult": True}}), True)
