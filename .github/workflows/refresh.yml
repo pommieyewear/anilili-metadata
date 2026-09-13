@@ -72,6 +72,13 @@ jobs:
       - name: Emit tree
         run: python scripts/konoha_build.py emit --out data
 
+      # Two aliased AniList requests per month and seconds to run, so it rides along with the daily
+      # refresh rather than earning a schedule of its own. Only the forward window is written: once
+      # a day has aired its rows are settled, and the file written while that month was current is
+      # already final.
+      - name: Write airing schedule
+        run: python scripts/konoha_build.py schedule --out data
+
       - name: Commit
         id: commit
         run: |
@@ -94,6 +101,13 @@ jobs:
         run: |
           for path in index.json id-map.json airing.json stats.json sync-status.json; do
             curl -sS "https://purge.jsdelivr.net/gh/${{ github.repository }}@main/data/$path" > /dev/null
+          done
+          # Named here rather than left to the diff below, which cannot reach them: it is capped at
+          # 2000 paths and a refresh changes tens of thousands under data/anime/, which sorts first.
+          # A schedule file rewritten daily and never purged is a calendar that goes stale for half
+          # a day at a time, which is the one thing this file exists to prevent.
+          for month in $(ls data/schedule 2>/dev/null); do
+            curl -sS "https://purge.jsdelivr.net/gh/${{ github.repository }}@main/data/schedule/$month" > /dev/null
           done
           git diff --name-only HEAD~1 HEAD -- data \
             | sed 's|^data/||' \

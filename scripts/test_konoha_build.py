@@ -12,12 +12,20 @@ test dependency to publish an APK is not a trade worth making.
 from __future__ import annotations
 
 import sys
+from datetime import datetime, timezone
 
 from konoha_build import (
+    _iso_air_date,
+    far_year_season,
+    forward_months,
     is_sequel,
     normalize_title,
     pick_group,
     pick_season,
+    schedule_days,
+    schedule_query,
+    schedule_row,
+    schedule_rows,
     series_search_query,
     titles_match,
     to_episodes,
@@ -119,6 +127,36 @@ check("no real seasons", pick_season([{"season_number": 0, "episode_count": 3}],
 check("lone season refused for a sequel", pick_season(MERGED, None, 2027, sequel=True), None)
 check("lone season still taken for a series", pick_season(MERGED, None, 2027, sequel=False), MERGED[0])
 
+# -- far_year_season ---------------------------------------------------------------------------
+# Attack on Titan: AniList's Final Season Part 2 is twelve episodes from 2022, TMDB keeps the whole
+# Final Season as one season of 28, and its *second* season is twelve episodes from 2017. Twelve
+# was unique, so the count rule handed Part 2 the 2017 season and every viewer of one of the most
+# watched titles there is got another season's titles and stills.
+TITAN = [
+    {"season_number": 1, "episode_count": 25, "air_date": "2013-04-07"},
+    {"season_number": 2, "episode_count": 12, "air_date": "2017-04-01"},
+    {"season_number": 3, "episode_count": 22, "air_date": "2018-07-23"},
+    {"season_number": 4, "episode_count": 28, "air_date": "2020-12-07"},
+]
+check("count match five years out is not picked", pick_season(TITAN, 12, 2022), None)
+check("it is held for after the groups", far_year_season(TITAN, 12, 2022), TITAN[1])
+# The slipped season is the case the slack exists for, so it stays a first-class match and is not
+# also offered as a fallback.
+check("a year of slack is still a match", pick_season(SLIPPED, 12, 2024), SLIPPED[0])
+check("so it is not demoted", far_year_season(SLIPPED, 12, 2024), None)
+check("an exact year is never demoted", far_year_season(TITAN, 12, 2017), None)
+check("ambiguity is not a fallback either", far_year_season(AMBIGUOUS, 12, 2024), None)
+check("no count, nothing to demote", far_year_season(TITAN, None, 2022), None)
+
+# -- _iso_air_date -----------------------------------------------------------------------------
+# A one-episode special is found by its date alone, so a partial date has to be refused rather than
+# padded: TMDB would match "2023-11-01" to a real episode that is not this one.
+check("full date", _iso_air_date({"year": 2023, "month": 11, "day": 5}), "2023-11-05")
+check("month and day are padded", _iso_air_date({"year": 2023, "month": 3, "day": 4}), "2023-03-04")
+check("a missing day is not a date", _iso_air_date({"year": 2023, "month": 11}), None)
+check("a year alone is not a date", _iso_air_date({"year": 2023}), None)
+check("no date at all", _iso_air_date(None), None)
+
 # -- is_sequel ---------------------------------------------------------------------------------
 check("ordinal season is a sequel", is_sequel(media(romaji="Dandadan 3rd Season")), True)
 check("numbered season is a sequel", is_sequel(media(english="Black Clover Season 2")), True)
@@ -190,6 +228,86 @@ blank = to_episodes([{"episode_number": 1, "name": "", "still_path": "", "air_da
 check("blank title becomes null", blank[0]["title"], None)
 check("blank still becomes null", blank[0]["still"], None)
 check("blank air date becomes null", blank[0]["air_date"], None)
+
+
+# -- schedule ----------------------------------------------------------------------------------
+# The month files are what the calendar draws from, so an off-by-one in the day windows is not a
+# misdrawn grid — it is a month of episodes filed under the wrong dates.
+
+sept = schedule_days("2026-09")
+check("a padded month is the month plus a week either side", len(sept), 30 + 14)
+check("starts a week before the first", sept[0][0], int(datetime(2026, 8, 25, tzinfo=timezone.utc).timestamp()))
+check("ends a week after the last", sept[-1][1], int(datetime(2026, 10, 8, tzinfo=timezone.utc).timestamp()))
+check("each window is one whole day", {end - start for start, end in sept}, {86400})
+check("windows are contiguous", [start for start, _ in sept[1:]], [end for _, end in sept[:-1]])
+
+# December has to roll the year, and February has to not assume 30.
+check("december rolls into january", len(schedule_days("2026-12")), 31 + 14)
+check("february is short", len(schedule_days("2027-02")), 28 + 14)
+check("a leap february is not", len(schedule_days("2028-02")), 29 + 14)
+
+# Half-open, the way the app's own day windows are: AniList compares strictly, so the bounds in the
+# query sit one second outside the day.
+query = schedule_query([(1_000_000, 1_086_400)])
+check("lower bound moved out by one", "airingAt_greater: 999999" in query, True)
+check("upper bound is the exclusive end", "airingAt_lesser: 1086400" in query, True)
+check("one alias per day", query.count(": Page("), 1)
+check("many days, one query", schedule_query(sept[:29]).count(": Page("), 29)
+
+# A row carries every title form because `title.preferred` in the app falls back english → romaji →
+# native; pre-picking one here would freeze the app's preference order into the dataset.
+airing = {
+    "episode": 5,
+    "airingAt": 1_700_000_000,
+    "media": {
+        "id": 21,
+        "title": {"english": "One Piece", "romaji": "ONE PIECE", "native": "ワンピース"},
+        "coverImage": {"extraLarge": "https://x/xl.jpg", "large": "https://x/l.jpg"},
+        "format": "TV",
+        "seasonYear": 1999,
+        "isAdult": False,
+    },
+}
+row = schedule_row(airing)
+check("cover prefers extraLarge", row["cover"], "https://x/xl.jpg")
+check("every title form is carried", (row["english"], row["romaji"], row["native"]),
+      ("One Piece", "ONE PIECE", "ワンピース"))
+check("a non-adult row says nothing at all", "adult" in row, False)
+check("an adult row is flagged", "adult" in schedule_row(
+    {**airing, "media": {**airing["media"], "isAdult": True}}), True)
+check("a schedule entry with no media is dropped", schedule_row({"episode": 1, "airingAt": 1}), None)
+
+# Rows are sorted and deduplicated because this file is rewritten daily and committed: an unstable
+# order is a changed file every day, a wasted purge, and a diff that says nothing.
+def _page(entries: list[dict]) -> dict:
+    return {"pageInfo": {"hasNextPage": False}, "airingSchedules": entries}
+
+
+def _entry(media_id: int, at: int) -> dict:
+    return {"episode": 1, "airingAt": at, "media": {"id": media_id, "title": {"romaji": "x"},
+            "coverImage": {"large": "l"}, "format": "TV", "seasonYear": 2026, "isAdult": False}}
+
+
+pages = {
+    "d0": _page([_entry(2, 300), _entry(1, 100), _entry(1, 100)]),
+    "d1": _page([_entry(3, 200), _entry(1, 400)]),
+}
+ordered = schedule_rows(pages, [(0, 1), (1, 2)], "2026-09")
+# Grouped by title and only then by time, which is what earns the 2.3x that `schedule_rows`
+# measured: one title's repeated name and cover URL have to sit inside gzip's window, and in time
+# order they do not. Asserting the times alone would pass for either ordering, so the ids are
+# checked with them.
+check("a title's airings stay adjacent, in time order within the title",
+      [(r["airingAt"], r["id"]) for r in ordered],
+      [(100, 1), (400, 1), (300, 2), (200, 3)])
+check("the same airing twice is one row", len(ordered), 4)
+check("a day AniList did not answer for is skipped", len(schedule_rows({}, [(0, 1)], "2026-09")), 0)
+
+# The forward window is the current month and the next, and has to roll the year like the rest.
+check("forward window", forward_months(2, datetime(2026, 9, 12, tzinfo=timezone.utc)), ["2026-09", "2026-10"])
+check("forward window rolls the year",
+      forward_months(3, datetime(2026, 11, 30, tzinfo=timezone.utc)), ["2026-11", "2026-12", "2027-01"])
+check("a window is never empty", forward_months(0, datetime(2026, 9, 12, tzinfo=timezone.utc)), ["2026-09"])
 
 
 if FAILURES:

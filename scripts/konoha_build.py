@@ -22,10 +22,11 @@ Stages are separate commands because they fail differently and the expensive one
     catalog     Walk AniList for every anime. ~20,800 titles, ~25 min (AniList is the slow one).
     episodes    Ask TMDB for episode lists. ~15,000 titles, ~20 min at 8 workers. Resumable.
     emit        Write the publishable tree from what the first two cached.
+    schedule    Write per-month airing times for the calendar. 2 requests a month, seconds.
     assets      Copy the bundled files into app/src/main/assets/.
 
-A daily refresh is `catalog` + `episodes --airing-only` + `emit`, which only touches titles that
-can still change.
+A daily refresh is `catalog` + `episodes --airing-only` + `emit` + `schedule`, which only touches
+titles that can still change.
 
 Usage:
     scripts/.venv/Scripts/python.exe scripts/konoha_build.py catalog
@@ -46,7 +47,7 @@ import threading
 import time
 import typing
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import requests
 
@@ -88,6 +89,21 @@ RATE_BUFFER = 5
 MIN_INTERVAL = 2.0
 INTERVAL_STEP = 0.5
 MAX_INTERVAL = 6.0
+
+# A month's schedule file covers the month plus a week either side, so one file serves a whole
+# calendar grid — including the neighbouring days that finish its first and last weeks — in any
+# device timezone. See `schedule_days`.
+SCHEDULE_PAD_DAYS = 7
+
+# Days per aliased schedule request. AniList caps query complexity at 500 and this selection costs
+# 18 a day — 17 for the fields plus one for the `pageInfo` that catches an overflowing day — so 27
+# is what fits. 29 is answered with "Max query complexity should be 500 but got 522", and the 400
+# carries no partial result. A month plus its padding is two requests either way.
+SCHEDULE_DAYS_PER_REQUEST = 27
+
+# AniList caps perPage at 50 however it is asked. The busiest day measured over a year was 33, so a
+# day has never needed a second page — `schedule_rows` warns rather than paging if one ever does.
+SCHEDULE_PAGE_SIZE = 50
 
 # Walked one broadcast year at a time, because a straight paged walk cannot reach the end of the
 # catalogue: AniList refuses any request whose offset passes 5000 entries ("Page depth exceeds
@@ -158,6 +174,10 @@ MIN_TITLE_LENGTH = 6
 SEASONS_GROUP_TYPE = 6
 # Re:Zero carries eight groupings; trying them all would cost more than the stills are worth.
 MAX_GROUPS_TRIED = 2
+# TMDB files everything that is not a numbered season under season 0.
+SPECIALS_SEASON = 0
+# How far a TMDB season's first-episode year may sit from AniList's, and still be the same season.
+SEASON_YEAR_SLACK = 1
 
 
 def series_search_query(raw: str | None) -> str | None:
@@ -240,6 +260,9 @@ def pick_season(
     season of the wrong length is refused even when its year is the only one that fits: TMDB holds
     Dandadan's two AniList seasons as one season of 24 aired in 2024, and matching on year alone
     would hand the twelve-episode first season a twenty-four episode run.
+
+    A count that is unique but lands years away from the entry is not decided here at all — see
+    [far_year_season], which the caller tries only after the episode groups have had their turn.
     """
     real = [s for s in seasons if (s.get("season_number") or 0) > 0 and (s.get("episode_count") or 0) > 0]
     if not real:
@@ -249,7 +272,9 @@ def pick_season(
         for season in same_count:
             if _year_of(season.get("air_date")) == wanted_year:
                 return season
-        return same_count[0] if len(same_count) == 1 else None
+        if len(same_count) == 1 and _year_is_near(same_count[0].get("air_date"), wanted_year):
+            return same_count[0]
+        return None
     if wanted_year is not None:
         same_year = [s for s in real if _year_of(s.get("air_date")) == wanted_year]
         if len(same_year) == 1:
@@ -262,6 +287,47 @@ def pick_season(
     if sequel:
         return None
     return real[0] if len(real) == 1 else None
+
+
+def far_year_season(
+    seasons: list[dict], wanted_episodes: int | None, wanted_year: int | None
+) -> dict | None:
+    """The lone count match [pick_season] held back because its year is nowhere near the entry's.
+
+    Attack on Titan is why this exists. AniList's Final Season Part 2 is twelve episodes from 2022;
+    TMDB keeps the Final Season as one season of 28 and its *second* season is twelve episodes from
+    2017. Twelve was unique, so the count rule took it and every viewer of Part 2 got 2017's titles
+    and stills — the wrong show's episodes, on one of the most-watched titles there is.
+
+    Five years apart is not a season TMDB dated differently, so the answer is demoted rather than
+    trusted: the episode groups are asked first, and for that title one of them holds a "Final
+    Season Part 2" of exactly twelve beginning in 2022. It is still returned when they find nothing,
+    because a count match with an implausible year is better than no episodes at all — that is what
+    this used to return outright, and nothing that works today should stop working.
+    """
+    if wanted_episodes is None:
+        return None
+    real = [s for s in seasons if (s.get("season_number") or 0) > 0 and (s.get("episode_count") or 0) > 0]
+    same_count = [s for s in real if s.get("episode_count") == wanted_episodes]
+    if len(same_count) != 1 or _year_is_near(same_count[0].get("air_date"), wanted_year):
+        return None
+    return same_count[0]
+
+
+def _year_is_near(air_date: str | None, wanted_year: int | None) -> bool:
+    """Whether a TMDB season's year is close enough to be the same broadcast season.
+
+    One year of slack, because the two catalogues are not measuring the same thing: TMDB dates a
+    season by its first episode while AniList files a show by the season it is announced for, so an
+    autumn run crossing into January is routinely a year apart. Nothing to compare is not evidence
+    against a match, so both missing values pass.
+    """
+    if wanted_year is None:
+        return True
+    year = _year_of(air_date)
+    if year is None:
+        return True
+    return abs(year - wanted_year) <= SEASON_YEAR_SLACK
 
 
 def whole_series_seasons(entry: dict, seasons: list[dict], sequel: bool) -> list[dict]:
@@ -372,14 +438,25 @@ class AniList:
             time.sleep(window + 1)
 
     def fetch(self, page: int, per_page: int, variables: dict) -> dict:
+        data = self.post(
+            CATALOG_QUERY,
+            {"page": page, "perPage": per_page, **variables},
+            label=f"{variables} page {page}",
+        )
+        return data["Page"]
+
+    def post(self, query: str, variables: dict, label: str = "") -> dict:
+        """One paced, retried GraphQL call, returning the whole `data` object.
+
+        Separate from [fetch] because the schedule walk asks for many aliased `Page` fields in one
+        query rather than one `Page` paged to exhaustion, so there is no single page to unwrap —
+        but it wants the same pacing, the same 429 handling and the same budget tracking.
+        """
         for attempt in range(6):
             self._pace()
             response = self.session.post(
                 ANILIST_API,
-                json={
-                    "query": CATALOG_QUERY,
-                    "variables": {"page": page, "perPage": per_page, **variables},
-                },
+                json={"query": query, "variables": variables},
                 timeout=45,
             )
             self.last_request = time.time()
@@ -409,9 +486,9 @@ class AniList:
             response.raise_for_status()
             body = response.json()
             if body.get("errors"):
-                raise RuntimeError(f"AniList error on {variables} page {page}: {body['errors']}")
-            return body["data"]["Page"]
-        raise RuntimeError(f"AniList {variables} page {page} failed after retries")
+                raise RuntimeError(f"AniList error on {label or variables}: {body['errors']}")
+            return body["data"]
+        raise RuntimeError(f"AniList {label or variables} failed after retries")
 
 
 def cmd_catalog(args: argparse.Namespace) -> int:
@@ -539,6 +616,67 @@ def load_fribb(refresh: bool = False) -> dict[int, FribbEntry]:
     return index
 
 
+def _iso_air_date(start: dict | None) -> str | None:
+    """An AniList `startDate` as the `YYYY-MM-DD` TMDB writes, or None unless all three are known."""
+    if not start:
+        return None
+    year, month, day = start.get("year"), start.get("month"), start.get("day")
+    if not year or not month or not day:
+        return None
+    return f"{year:04d}-{month:02d}-{day:02d}"
+
+
+def _air_order(entry: dict) -> tuple:
+    """Broadcast order key. Start date first, AniList id as the tiebreak for same-day entries."""
+    start = entry.get("startDate") or {}
+    return (
+        start.get("year") or 9999,
+        start.get("month") or 99,
+        start.get("day") or 99,
+        entry["id"],
+    )
+
+
+def cour_slices(catalog: list[dict], fribb: dict[int, FribbEntry]) -> dict[int, tuple[int, int, int]]:
+    """Where each split-cour entry sits inside the TMDB season it shares, by AniList id.
+
+    A split cour is one broadcast season that AniList files as several entries. TMDB keeps BLEACH's
+    four Thousand-Year Blood War parts as a single season 2 of fifty episodes; AniList calls them
+    13, 13, 14 and 10 — which is fifty. Nothing above can resolve that: the season is the wrong
+    length for every one of the four, so each is rejected and all four end up with no episodes at
+    all, which is what put black rows on every season of that title.
+
+    The parts are contiguous and in broadcast order, so their own counts say where each begins. That
+    is only trustworthy when they account for the whole season exactly, so the group total is
+    carried and checked against the season actually fetched before any of it is used — a group whose
+    counts sum to something else is not a cour split and is left to the ordinary matching.
+
+    Returns `(offset, count, group_total)` per id, for the 265 titles that share a season with a
+    sibling. Groups where any member states no episode count are skipped; there is nothing to
+    measure from.
+    """
+    grouped: dict[tuple[int, int], list[dict]] = {}
+    for entry in catalog:
+        cross = fribb.get(entry["id"])
+        if cross and cross.tmdb_id and cross.tmdb_season:
+            grouped.setdefault((cross.tmdb_id, cross.tmdb_season), []).append(entry)
+
+    slices: dict[int, tuple[int, int, int]] = {}
+    for members in grouped.values():
+        if len(members) < 2:
+            continue
+        ordered = sorted(members, key=_air_order)
+        counts = [member.get("episodes") for member in ordered]
+        if any(count is None or count <= 0 for count in counts):
+            continue
+        total = sum(counts)
+        offset = 0
+        for member, count in zip(ordered, counts):
+            slices[member["id"]] = (offset, count, total)
+            offset += count
+    return slices
+
+
 def previous_id_map(out: pathlib.Path | None = None) -> dict[str, dict]:
     """The last id-map this pipeline produced, for the fields it cannot regenerate.
 
@@ -629,6 +767,7 @@ class Tmdb:
         entry: dict,
         hint_id: int | None,
         fribb: FribbEntry | None = None,
+        cour: tuple[int, int, int] | None = None,
     ) -> tuple[list[dict], int | None]:
         """Episode rows for one AniList title, plus the TMDB series id they came from."""
         wanted_episodes = entry.get("episodes")
@@ -644,6 +783,15 @@ class Tmdb:
             raw = (payload or {}).get("episodes") or []
             if raw and (wanted_episodes is None or len(raw) == wanted_episodes):
                 return to_episodes(raw), fribb.tmdb_id
+            # The season is the wrong length for this entry alone, which is what a split cour looks
+            # like: several AniList entries sharing one broadcast season. Their counts say where
+            # each begins, but only once they are shown to account for this exact season — see
+            # `cour_slices`.
+            if raw and cour and len(raw) == cour[2]:
+                start, count, _ = cour
+                part = raw[start : start + count]
+                if len(part) == count:
+                    return to_episodes(part), fribb.tmdb_id
 
         # Fribb's id is a better starting point than the old bundled map's even when it names no
         # season: it is anime-specific and rebuilt weekly, where the bundled map is a frozen copy of
@@ -699,7 +847,48 @@ class Tmdb:
             matched = pick_group((detail or {}).get("groups") or [], wanted_episodes, wanted_year)
             if matched:
                 return to_episodes(matched.get("episodes") or []), series_id
+
+        # A one-episode entry matches no numbered season and no group by count, because TMDB does
+        # not give a special a season of its own — it files it under season 0 with the date it
+        # aired. Attack on Titan's two FINAL CHAPTERS specials are AniList entries of one episode
+        # each and TMDB season 0 episodes 36 and 37, and nothing above can see them.
+        single = self.specials_episode(entry, series_id, wanted_episodes)
+        if single:
+            return single, series_id
+
+        # Nothing lines up on this series' own terms, so the count match whose year did not fit is
+        # taken after all rather than leaving the title with no episodes at all.
+        demoted = far_year_season(seasons, wanted_episodes, wanted_year)
+        if demoted:
+            payload = self.get(f"/tv/{series_id}/season/{demoted['season_number']}")
+            raw = (payload or {}).get("episodes") or []
+            if raw:
+                return to_episodes(raw), series_id
         return [], series_id
+
+    def specials_episode(
+        self, entry: dict, series_id: int, wanted_episodes: int | None
+    ) -> list[dict]:
+        """The single episode of a one-episode entry, found by its air date in TMDB's specials.
+
+        Only a stated count of exactly one is answered here: for anything longer the season and
+        group matching above is the better instrument, and a date on its own would be a guess. The
+        date has to be AniList's own and match a season 0 episode exactly, and exactly one of them —
+        two specials of the same series on the same day cannot be told apart by this and are left
+        for the fallbacks.
+        """
+        if wanted_episodes != 1:
+            return []
+        aired = _iso_air_date(entry.get("startDate"))
+        if not aired:
+            return []
+        payload = self.get(f"/tv/{series_id}/season/{SPECIALS_SEASON}")
+        same_day = [
+            episode
+            for episode in ((payload or {}).get("episodes") or [])
+            if episode.get("air_date") == aired
+        ]
+        return to_episodes(same_day) if len(same_day) == 1 else []
 
 
 def tmdb_token(explicit: str | None) -> str:
@@ -729,7 +918,11 @@ def cmd_episodes(args: argparse.Namespace) -> int:
     tmdb = Tmdb(tmdb_token(args.token))
 
     fribb = load_fribb(args.refresh_fribb)
-    print(f"fribb cross-reference: {len(fribb)} AniList ids", flush=True)
+    cours = cour_slices(catalog, fribb)
+    print(
+        f"fribb cross-reference: {len(fribb)} AniList ids, {len(cours)} titles share a season",
+        flush=True,
+    )
 
     # The old id-map is only a fallback hint now, for the 9% of the catalogue Fribb has never
     # heard of. Its own `confidence` is not trusted — every hint is re-checked by titles_match.
@@ -760,7 +953,7 @@ def cmd_episodes(args: argparse.Namespace) -> int:
         nonlocal done, matched
         try:
             episodes, series_id = tmdb.episodes_for(
-                entry, hints.get(entry["id"]), fribb.get(entry["id"])
+                entry, hints.get(entry["id"]), fribb.get(entry["id"]), cours.get(entry["id"])
             )
         except Exception as error:  # noqa: BLE001 - one bad title must not end an hours-long run
             with lock:
@@ -782,6 +975,216 @@ def cmd_episodes(args: argparse.Namespace) -> int:
         list(pool.map(work, targets))
 
     print(f"\ndone: {done} fetched, {matched} with episodes")
+    return 0
+
+
+# --------------------------------------------------------------------------------------------
+# Schedule
+# --------------------------------------------------------------------------------------------
+#
+# One file per month of airing times, so the app's calendar draws a month — grid counts and every
+# day's episode list — from a single CDN read instead of a request per day against AniList. The
+# app's own live path stays as the fallback; see `MiruroRepository.schedule`.
+#
+# Why this is worth publishing rather than asking for at request time (measured 2026-09-12):
+#
+#   a month grid, live    1 aliased AniList request, 0.5-16.8s, then ~340ms per day tapped
+#   a month shard         one jsDelivr read, 22-87ms, and every day in it is then local
+#   a month, live         ~402KB on the wire at the field depth the day list already asks for
+#   a month shard         ~12KB gzipped, 462 rows
+#
+# It also takes the calendar off AniList's rate budget entirely, which matters because that budget
+# is shared with search and the detail pages and degrades to 30/min without warning.
+
+
+def schedule_days(month: str, pad_days: int = SCHEDULE_PAD_DAYS) -> list[tuple[int, int]]:
+    """The half-open [start, end) epoch-second windows a month's file covers, one per UTC day.
+
+    Padded a week either side of the month itself for two reasons. A calendar grid draws the days
+    that finish the neighbouring months — up to six of them — and the viewer's device buckets these
+    rows into *its* zone, not UTC, so a row that this function files under the 1st can belong to the
+    last day of the previous month on a device in Honolulu. A week covers both, which is what lets
+    one file serve a whole grid rather than three files stitched together.
+
+    Neighbouring months therefore overlap by a fortnight. That is deliberate: the reader deduplicates
+    by (airingAt, id) the same way the live path does, so an episode present in both files is one row.
+    """
+    year, mon = (int(part) for part in month.split("-"))
+    first = datetime(year, mon, 1, tzinfo=timezone.utc)
+    # December rolls to January of the next year; `mon // 12` is 1 only for December.
+    next_first = datetime(year + (mon // 12), (mon % 12) + 1, 1, tzinfo=timezone.utc)
+    windows: list[tuple[int, int]] = []
+    cursor = first - timedelta(days=pad_days)
+    end = next_first + timedelta(days=pad_days)
+    while cursor < end:
+        following = cursor + timedelta(days=1)
+        windows.append((int(cursor.timestamp()), int(following.timestamp())))
+        cursor = following
+    return windows
+
+
+def schedule_query(windows: list[tuple[int, int]]) -> str:
+    """One query asking for every day in [windows] at once, each as its own aliased `Page`.
+
+    A day per request would cost ~45 requests per month against a budget that degrades to 30/min,
+    and paging a whole month as one range costs about ten. Aliased, a month is two requests and two
+    rate-limit units whatever it holds.
+
+    The alias count is capped by AniList's query complexity limit rather than by anything here: the
+    ceiling is 500 and this shape costs 18 a day, which is why `SCHEDULE_DAYS_PER_REQUEST` is 27.
+    Adding a field to the selection below lowers that number — an overrun is answered with a plain
+    HTTP 400 naming the complexity, not with a partial result.
+    """
+    fields = (
+        "episode airingAt media { id title { english romaji native } "
+        "coverImage { extraLarge large } format seasonYear isAdult }"
+    )
+    lines = ["query {"]
+    for index, (start, end) in enumerate(windows):
+        # AniList compares strictly, so both bounds move out by one second to stay half-open.
+        lines.append(
+            f"  d{index}: Page(page: 1, perPage: {SCHEDULE_PAGE_SIZE}) {{ "
+            f"pageInfo {{ hasNextPage }} "
+            f"airingSchedules(airingAt_greater: {start - 1}, airingAt_lesser: {end}, sort: TIME) "
+            f"{{ {fields} }} }}"
+        )
+    lines.append("}")
+    return "\n".join(lines)
+
+
+def schedule_row(entry: dict) -> dict | None:
+    """One airing as the app stores it, or None for an entry with no title behind it.
+
+    The fields are exactly what a schedule row renders — `title.preferred` falls back
+    english → romaji → native and `coverImage.best` prefers extraLarge, so all of those are carried
+    rather than a single pre-picked string, which would freeze the app's own preference order into
+    the dataset. Nulls are dropped: the reader defaults them and a month is mostly nulls.
+    """
+    media = entry.get("media") or {}
+    if not media.get("id"):
+        return None
+    title = media.get("title") or {}
+    cover = media.get("coverImage") or {}
+    row = {
+        "id": media["id"],
+        "episode": entry.get("episode"),
+        "airingAt": entry.get("airingAt"),
+        "english": title.get("english"),
+        "romaji": title.get("romaji"),
+        "native": title.get("native"),
+        "cover": cover.get("extraLarge") or cover.get("large"),
+        "format": media.get("format"),
+        "year": media.get("seasonYear"),
+        # Carried unfiltered so the viewer's own setting decides at read time, the way the live
+        # path already does. Filtering here would bake one audience's answer into the CDN.
+        "adult": True if media.get("isAdult") else None,
+    }
+    return {key: value for key, value in row.items() if value is not None}
+
+
+def schedule_rows(pages: dict, windows: list[tuple[int, int]], month: str) -> list[dict]:
+    """Flatten one response into deduplicated, stably ordered rows.
+
+    Sorted rather than left in arrival order because this file is rewritten daily and committed: an
+    unstable order would show up as a changed file every single day, which costs a purge and makes
+    the diff useless for seeing what actually moved.
+
+    Sorted by *title* rather than by time, which the reader does not care about either way — it has
+    to bucket these into the device's own zone regardless — but gzip cares a great deal. A title's
+    four or five weekly airings repeat its name and cover URL verbatim; in time order those copies
+    land ~45KB apart, outside gzip's 32KB window, and the month compresses 2.3x worse (measured on
+    2026-09: 50,602 bytes by time against 22,190 by title, for byte-identical content).
+    """
+    rows: list[dict] = []
+    seen: set[tuple[int, int]] = set()
+    for index in range(len(windows)):
+        page = pages.get(f"d{index}")
+        if page is None:
+            continue
+        if page.get("pageInfo", {}).get("hasNextPage"):
+            # 50 in a day has never been observed (31 was the busiest measured), so this is a
+            # loud warning rather than paging support that would never run.
+            print(f"  WARNING {month} day {index} overflowed one page — rows are missing", flush=True)
+        for entry in page.get("airingSchedules") or []:
+            row = schedule_row(entry)
+            if row is None:
+                continue
+            key = (row["airingAt"], row["id"])
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append(row)
+    rows.sort(key=schedule_order)
+    return rows
+
+
+def schedule_order(row: dict) -> tuple[int, int]:
+    """Title first, then time — see `schedule_rows` for why this is not sorted by time.
+
+    Keyed on the id rather than on the title itself, which sorts the same titles together just as
+    well: one id is one title, so its rows carry byte-identical name and cover strings either way,
+    and an id cannot be absent or null the way every one of the three title forms can.
+    """
+    return (row["id"], row["airingAt"])
+
+
+def forward_months(count: int, today: datetime | None = None) -> list[str]:
+    """The current month and the next ones, as `YYYY-MM`.
+
+    The window is forward-only because the months behind it need no refreshing: once a day has
+    aired its rows are settled, and the file written while that month was current is already final.
+    The archive is simply what the rolling window leaves behind.
+    """
+    now = today or datetime.now(timezone.utc)
+    months = []
+    year, mon = now.year, now.month
+    for _ in range(max(count, 1)):
+        months.append(f"{year:04d}-{mon:02d}")
+        year, mon = year + (mon // 12), (mon % 12) + 1
+    return months
+
+
+def cmd_schedule(args: argparse.Namespace) -> int:
+    out = pathlib.Path(args.out)
+    session = requests.Session()
+    session.headers.update(
+        {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "User-Agent": "Anilili-konoha-build (AniList client 45552)",
+            # Same reason as the catalog walk: no Referer earns a 403 that reads like an outage.
+            "Referer": "android-app://com.miruronative",
+        }
+    )
+    anilist = AniList(session, args.min_interval)
+
+    months = args.month or forward_months(args.months)
+    for month in months:
+        path = out / "schedule" / f"{month}.json"
+        if args.skip_existing and path.exists():
+            print(f"{month} already published, leaving it alone", flush=True)
+            continue
+        windows = schedule_days(month)
+        rows: list[dict] = []
+        for start in range(0, len(windows), args.days_per_request):
+            chunk = windows[start : start + args.days_per_request]
+            pages = anilist.post(schedule_query(chunk), {}, label=f"schedule {month} day {start}")
+            rows.extend(schedule_rows(pages, chunk, month))
+        # The chunks overlap nothing, but the pad days do overlap the neighbouring months, so the
+        # dedupe has to run across the whole file and not just within a chunk.
+        deduped: list[dict] = []
+        seen: set[tuple[int, int]] = set()
+        for row in rows:
+            key = (row["airingAt"], row["id"])
+            if key not in seen:
+                seen.add(key)
+                deduped.append(row)
+        # Each chunk sorted itself, but concatenating them does not, and the ordering is what keeps
+        # the file compressible and its daily diff meaningful.
+        deduped.sort(key=schedule_order)
+        _write(path, deduped)
+        titles = len({row["id"] for row in deduped})
+        print(f"{month} {len(deduped)} rows, {titles} titles -> {path}", flush=True)
     return 0
 
 
@@ -1064,6 +1467,31 @@ def main(argv: list[str]) -> int:
         help="only RELEASING/NOT_YET_RELEASED titles — the daily refresh",
     )
     episodes.set_defaults(func=cmd_episodes)
+
+    schedule = commands.add_parser("schedule", help="write per-month airing times for the calendar")
+    schedule.add_argument("--out", default=str(WORK / "data"))
+    schedule.add_argument(
+        "--months",
+        type=int,
+        default=2,
+        help="how many months from this one to (re)write — the current one and the next by default,"
+        " because a viewer stepping forward on the last day of a month needs the next one to exist",
+    )
+    schedule.add_argument(
+        "--month",
+        action="append",
+        metavar="YYYY-MM",
+        help="write exactly this month instead of the forward window; repeatable, for backfilling",
+    )
+    schedule.add_argument(
+        "--skip-existing",
+        action="store_true",
+        help="leave months that already have a file alone — for a backfill that must not re-spend "
+        "the budget on work a previous run finished",
+    )
+    schedule.add_argument("--days-per-request", type=int, default=SCHEDULE_DAYS_PER_REQUEST)
+    schedule.add_argument("--min-interval", type=float, default=MIN_INTERVAL)
+    schedule.set_defaults(func=cmd_schedule)
 
     emit = commands.add_parser("emit", help="write the publishable tree")
     emit.add_argument("--out", default=str(WORK / "data"))
