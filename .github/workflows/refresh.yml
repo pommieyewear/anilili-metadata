@@ -118,6 +118,23 @@ jobs:
             --bangumi-data build/bangumi/bangumi-data.json \
             --repo . --write
 
+      # Resolving a stream on the device is three requests to a site whose origin thinks for 400
+      # to 600ms — about 1,750ms from opening a title to playing. Doing it here instead turns that
+      # into a CDN read the app usually already holds: 111-167ms cold, nothing warm.
+      #
+      # Only sound because these URLs carry no token, signature or expiry — re-resolved eight hours
+      # apart, seven of seven came back byte-identical. They do move once: the site stages the
+      # current year under /temp/{YYMM}/ and files a title into its permanent archive at the
+      # rollover. Those records are marked `temp` and the app retires one the first time a player
+      # refuses it, so a restaged season costs one failed play rather than going quiet.
+      #
+      # Must run after `Join to Bangumi`: the crawl is keyed on the subject id that step writes.
+      - name: Resolve Lili streams
+        run: |
+          python scripts/lili_sources.py --repo . --top 200 --concurrency 4 \
+            --skip-fresh-days 30 --write
+          python scripts/lili_sources.py --repo . --airing --concurrency 4 --write
+
       - name: Commit
         id: commit
         run: |
