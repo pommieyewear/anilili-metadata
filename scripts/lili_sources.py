@@ -107,10 +107,34 @@ def layout_of(url: str) -> str:
 
 
 def best_channel(found: dict[int, dict[int, str]]) -> int | None:
-    """Whichever channel carries the most episodes; ties go to the lowest number."""
+    """The channel with the most episodes, and among those the one on the fastest host.
+
+    Coverage first, because a channel missing episodes cannot be made up for by being quick. But
+    the channels are mirrors of one file rather than a quality ladder, so where two carry the same
+    episodes the host decides: play.xfvod.pro is Cloudflare-fronted and sustained 28.7 Mbit/s while
+    apn.moedot.net redirects into China Unicom's consumer cloud and managed 10.2 for the same byte
+    range. Ranking by channel number instead picked the slow one whenever both were complete, which
+    is most airing titles.
+
+    Learning the host costs one watch page per candidate, which is why only the channels already
+    tied on coverage are sampled.
+    """
     if not found:
         return None
-    return sorted(found, key=lambda c: (-len(found[c]), c))[0]
+    most = max(len(v) for v in found.values())
+    tied = sorted(c for c in found if len(found[c]) == most)
+    if len(tied) == 1:
+        return tied[0]
+
+    ranked = []
+    for channel in tied:
+        first = found[channel][min(found[channel])]
+        host = ''
+        url = stream_url(first)
+        if url:
+            host = (urllib.parse.urlsplit(url).hostname or '').lower()
+        ranked.append((HOST_RANK.get(host, len(HOST_RANK)), channel))
+    return min(ranked)[1]
 
 
 def crawl(title: dict, concurrency: int, prior: dict | None = None) -> dict | None:
@@ -204,6 +228,9 @@ def main() -> int:
     ap.add_argument('--airing', action='store_true', help='crawl everything still releasing')
     ap.add_argument('--concurrency', type=int, default=4)
     ap.add_argument('--write', action='store_true')
+    ap.add_argument('--refresh', action='store_true',
+                    help='re-resolve every episode instead of carrying a stored record forward; '
+                         'what the year rollover needs, when staged paths move into the archive')
     ap.add_argument('--skip-fresh-days', type=int, default=0,
                     help='leave an archive entry alone if it was crawled within N days')
     args = ap.parse_args()
@@ -233,7 +260,7 @@ def main() -> int:
                 continue
 
         try:
-            record = crawl(title, args.concurrency, prior)
+            record = crawl(title, args.concurrency, None if args.refresh else prior)
         except Exception as exc:
             print(f'{anilist_id} {label[:34]:<34} FAILED {type(exc).__name__}: {exc}')
             continue
