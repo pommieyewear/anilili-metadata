@@ -113,7 +113,7 @@ def best_channel(found: dict[int, dict[int, str]]) -> int | None:
     return sorted(found, key=lambda c: (-len(found[c]), c))[0]
 
 
-def crawl(title: dict, concurrency: int) -> dict | None:
+def crawl(title: dict, concurrency: int, prior: dict | None = None) -> dict | None:
     bangumi = title['bangumi']
     path = subject_path(bangumi['id'], bangumi.get('search_names') or [])
     if not path:
@@ -123,11 +123,24 @@ def crawl(title: dict, concurrency: int) -> dict | None:
     if channel is None:
         return None
 
-    numbers = sorted(found[channel])
-    with ThreadPoolExecutor(max_workers=concurrency) as pool:
-        urls = list(pool.map(lambda n: stream_url(found[channel][n]), numbers))
+    # An airing title gains one episode a week and keeps the rest, so re-resolving all of them to
+    # discover the new one is most of a nightly crawl spent learning nothing. Episodes already
+    # recorded are carried over and only the new ones are fetched -- the difference between a few
+    # thousand requests a night and a few dozen.
+    known: dict[str, str] = {}
+    if prior and prior.get('subject') == path:
+        base = prior.get('base', '')
+        known = {k: base + v for k, v in (prior.get('episodes') or {}).items()}
 
-    got = {str(n): u for n, u in zip(numbers, urls) if u}
+    numbers = sorted(found[channel])
+    wanted = [n for n in numbers if str(n) not in known]
+    with ThreadPoolExecutor(max_workers=concurrency) as pool:
+        urls = list(pool.map(lambda n: stream_url(found[channel][n]), wanted))
+
+    got = dict(known)
+    got.update({str(n): u for n, u in zip(wanted, urls) if u})
+    # An episode the site has dropped should not linger in the record forever.
+    got = {k: v for k, v in got.items() if int(k) in found[channel]}
     if not got:
         return None
     layouts = {layout_of(u) for u in got.values()}
@@ -211,8 +224,8 @@ def main() -> int:
             continue
 
         out_path = os.path.join(os.path.dirname(index_path), 'lili.json')
-        if args.skip_fresh_days and os.path.exists(out_path):
-            prior = read_json(out_path)
+        prior = read_json(out_path) if os.path.exists(out_path) else None
+        if args.skip_fresh_days and prior:
             age = (time.time() - time.mktime(time.strptime(prior['crawled'], '%Y-%m-%d'))) / 86400
             # An archive path has not moved in years; only `temp` is worth re-checking.
             if prior.get('layout') == 'archive' and age < args.skip_fresh_days:
@@ -220,7 +233,7 @@ def main() -> int:
                 continue
 
         try:
-            record = crawl(title, args.concurrency)
+            record = crawl(title, args.concurrency, prior)
         except Exception as exc:
             print(f'{anilist_id} {label[:34]:<34} FAILED {type(exc).__name__}: {exc}')
             continue
