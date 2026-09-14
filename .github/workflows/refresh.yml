@@ -79,6 +79,45 @@ jobs:
       - name: Write airing schedule
         run: python scripts/konoha_build.py schedule --out data
 
+      # Bangumi is how the Chinese-language sources become reachable: they index by Chinese name,
+      # and the name they use is often an *alias* rather than Bangumi's own name_cn. Reading
+      # aliases costs an extra API call per candidate, so this joins against the weekly Archive
+      # dump instead -- which also matches better, seeing every name at once rather than the top
+      # rows of a search ranking (99.0% agreement with bangumi-data's curated pairs; the
+      # disagreements are franchise granularity, where the corroborated match is the better
+      # answer, so they are queued for review rather than applied).
+      #
+      # Must run after `emit`, which rewrites every per-title index.json and would drop the block.
+      - name: Resolve Bangumi dump
+        id: bgmdump
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          asset=$(gh api repos/bangumi/Archive/releases --jq \
+            '[.[0].assets[] | select(.name | endswith(".zip"))] | sort_by(.name) | last')
+          echo "name=$(echo "$asset" | jq -r .name)" >> "$GITHUB_OUTPUT"
+          echo "url=$(echo "$asset" | jq -r .browser_download_url)" >> "$GITHUB_OUTPUT"
+
+      # ~440MB, published weekly, so six days out of seven this is a cache hit. Keyed on the asset
+      # name rather than the date so a skipped week reuses the copy already here.
+      - uses: actions/cache@v4
+        with:
+          path: build/bangumi
+          key: bangumi-dump-${{ steps.bgmdump.outputs.name }}
+
+      - name: Join to Bangumi
+        run: |
+          mkdir -p build/bangumi
+          dump="build/bangumi/${{ steps.bgmdump.outputs.name }}"
+          [ -f "$dump" ] || curl -sSL --retry 3 -o "$dump" "${{ steps.bgmdump.outputs.url }}"
+          # Curated aniList<->bangumi pairs; consulted only where the name matcher is unsure.
+          curl -sSL --retry 3 -o build/bangumi/bangumi-data.json \
+            https://raw.githubusercontent.com/bangumi-data/bangumi-data/master/dist/data.json
+          python scripts/bangumi_backfill.py \
+            --dump "$dump" \
+            --bangumi-data build/bangumi/bangumi-data.json \
+            --repo . --write
+
       - name: Commit
         id: commit
         run: |

@@ -1,0 +1,27 @@
+{
+  "_comment": [
+    "Hand-checked AniList id -> Bangumi subject id. Wins over every automatic match.",
+    "Add an entry only after looking the subject up; bangumi-review.json is the queue to work from.",
+    "Most entries here exist because AniList and Bangumi disagree about where one show ends and",
+    "the next begins: AniList splits a cour-split run into two entries where Bangumi keeps one, so",
+    "both AniList ids point at the same subject. That is correct, not a collision.",
+    "A title Bangumi has not created yet (an unannounced season) does not belong here -- leave it",
+    "unmatched and the daily refresh will pick it up once the subject exists."
+  ],
+
+  "11741": 10639,
+  "395": 52764,
+  "551": 62893,
+  "17115": 40081,
+  "97769": 195937,
+  "209939": 638133,
+
+  "_notes": {
+    "11741": "Fate/Zero 2nd Season -> Fate/Zero. Bangumi keeps one 25-episode subject for both cours.",
+    "395": "Gantz: Second Stage -> GANTZ ~the 2nd stage~. Exact, 2004-08-26, 13 eps both sides.",
+    "551": "Grappler Baki Maximum Tournament -> グラップラー刃牙. Bangumi keeps the 48-episode run whole.",
+    "17115": "Pokemon BW Adventures in Unova -> ベストウイッシュ シーズン2, which absorbs the Episode N arc.",
+    "97769": "Yuki Yuna Hero Chapter -> the combined -鷲尾須美の章-/-勇者の章- subject.",
+    "209939": "Frieren season 3 -> 葬送のフリーレン 第3期【黄金郷編】; the matcher misses it on the bracket suffix."
+  }
+}
